@@ -1,8 +1,8 @@
 """
-Bryen Assistant v2.1 — Lark × Claude
-- Instant "thinking" message shown while processing
-- Progress updates for longer tasks
-- All v2.0 features included
+Bryen Assistant v2.2 — Lark × Claude
+- Reliable: sends thinking message first, then final reply as separate message
+- No message editing required (works on all Lark plans)
+- All features: tasks, calendar, weather, email, briefing, group chat
 """
 
 import os, json, time, threading, datetime, requests, re
@@ -26,58 +26,46 @@ task_board    = {}
 processed_ids = set()
 task_counter  = [0]
 
-# ── Thinking messages (rotates based on request type) ────────────────────────
-THINKING_MESSAGES = {
-    "default":  "🤔 Thinking...",
-    "calendar": "📅 Checking your calendar...",
-    "task":     "📋 Checking your task board...",
-    "weather":  "🌤️ Fetching weather...",
-    "email":    "📧 Drafting your email...",
-    "meeting":  "📊 Preparing meeting notes...",
-    "search":   "🔍 Searching for information...",
-    "briefing": "🌅 Preparing your daily briefing...",
-    "assign":   "👥 Recording task assignment...",
-}
-
+# ── Thinking messages ─────────────────────────────────────────────────────────
 def get_thinking_msg(text):
     t = text.lower()
     if any(k in t for k in ["calendar", "schedule", "meeting", "event", "今天", "会议"]):
-        return THINKING_MESSAGES["calendar"]
-    if any(k in t for k in ["task", "todo", "任务", "assign"]):
-        return THINKING_MESSAGES["task"]
+        return "📅 Checking your calendar..."
+    if any(k in t for k in ["task", "todo", "任务", "assign", "please", "tolong"]):
+        return "📋 Checking your task board..."
     if any(k in t for k in ["weather", "rain", "hot", "天气"]):
-        return THINKING_MESSAGES["weather"]
+        return "🌤️ Fetching weather..."
     if any(k in t for k in ["email", "邮件", "draft", "write to"]):
-        return THINKING_MESSAGES["email"]
+        return "📧 Drafting your email..."
     if any(k in t for k in ["meeting note", "summarize", "summary", "总结"]):
-        return THINKING_MESSAGES["meeting"]
+        return "📊 Preparing meeting notes..."
     if any(k in t for k in ["search", "find", "what is", "who is", "搜索", "查"]):
-        return THINKING_MESSAGES["search"]
-    if any(k in t for k in ["brief", "morning", "today", "早上", "今天"]):
-        return THINKING_MESSAGES["briefing"]
-    return THINKING_MESSAGES["default"]
+        return "🔍 Searching for information..."
+    if any(k in t for k in ["brief", "morning", "早上"]):
+        return "🌅 Preparing your daily briefing..."
+    return "🤔 Thinking..."
 
 SYSTEM_PROMPT = """You are Bryen Assistant — a smart, proactive executive personal assistant on Lark.
 
 CAPABILITIES:
-1. 📋 TASK MANAGEMENT — Record, track, assign tasks. Format: use numbered lists with status emojis (⏳ pending, ✅ done, 🔴 overdue)
-2. 📅 CALENDAR & MEETINGS — Help schedule meetings, add notes, suggest prep steps, set reminders
-3. 📧 EMAIL DRAFTING — Write professional emails when asked. Always show subject + body
-4. 📊 MEETING NOTES — Summarize and format meeting discussions into clean action items
-5. 🌐 WEB SEARCH — When asked about current info, news, or facts, provide best answer
+1. 📋 TASK MANAGEMENT — Record, track, assign tasks. Use ⏳ pending, ✅ done, 🔴 overdue
+2. 📅 CALENDAR & MEETINGS — Schedule meetings, add notes, suggest prep steps
+3. 📧 EMAIL DRAFTING — Write professional emails. Always show Subject + Body
+4. 📊 MEETING NOTES — Summarize discussions into clean action items
+5. 🌐 WEB SEARCH — Answer questions about current info and facts
 6. 🌤️ WEATHER — Factor weather into scheduling suggestions
-7. 🔔 DAILY BRIEFING — Provide structured morning briefings with tasks, meetings, and priorities
-8. 👥 TASK ASSIGNMENT — Help assign tasks to team members and track them
+7. 🔔 DAILY BRIEFING — Structured morning briefings with tasks, meetings, priorities
+8. 👥 TASK ASSIGNMENT — Assign tasks to team members and track them
 
 RULES:
 - Reply in the SAME language the user writes in (English, Chinese, Malay)
 - In GROUP CHATS: only respond when @mentioned, be concise
-- Always end with "💡 Suggestion:" offering one proactive tip
+- Always end with "💡 Suggestion:" with one proactive tip
 - For tasks mentioned to the user, auto-record them
-- Format all responses cleanly with emoji headers for Lark readability
-- Keep replies concise — use bullet points over long paragraphs
+- Format responses cleanly with emoji headers
+- Keep replies concise — bullet points over long paragraphs
 
-TASK FORMAT when recording:
+TASK FORMAT:
 📌 Task recorded:
 • Title: [task]
 • Assigned to: [person]
@@ -91,8 +79,10 @@ _token = {"v": None, "exp": 0}
 def get_token():
     if time.time() < _token["exp"] - 60:
         return _token["v"]
-    r = requests.post(f"{LARK_BASE}/auth/v3/tenant_access_token/internal",
-                      json={"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET})
+    r = requests.post(
+        f"{LARK_BASE}/auth/v3/tenant_access_token/internal",
+        json={"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET}
+    )
     d = r.json()
     _token["v"] = d["tenant_access_token"]
     _token["exp"] = time.time() + d.get("expire", 7200)
@@ -101,25 +91,23 @@ def get_token():
 def lark_headers():
     return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
 
-# ── Send message and return message_id (so we can update it) ─────────────────
+# ── Send message ──────────────────────────────────────────────────────────────
 def send_msg(receive_id, text, id_type="open_id"):
-    r = requests.post(
-        f"{LARK_BASE}/im/v1/messages?receive_id_type={id_type}",
-        headers=lark_headers(),
-        json={"receive_id": receive_id, "msg_type": "text",
-              "content": json.dumps({"text": text})}
-    )
-    return r.json().get("data", {}).get("message_id", "")
-
-# ── Update an existing message (edit in place) ────────────────────────────────
-def update_msg(message_id, new_text):
-    if not message_id:
-        return
-    requests.patch(
-        f"{LARK_BASE}/im/v1/messages/{message_id}",
-        headers=lark_headers(),
-        json={"msg_type": "text", "content": json.dumps({"text": new_text})}
-    )
+    try:
+        r = requests.post(
+            f"{LARK_BASE}/im/v1/messages?receive_id_type={id_type}",
+            headers=lark_headers(),
+            json={
+                "receive_id": receive_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": text})
+            },
+            timeout=10
+        )
+        return r.json()
+    except Exception as e:
+        print(f"send_msg error: {e}", flush=True)
+        return {}
 
 # ── Calendar ──────────────────────────────────────────────────────────────────
 def get_today_calendar():
@@ -127,9 +115,12 @@ def get_today_calendar():
         now   = datetime.datetime.utcnow()
         start = int(datetime.datetime(now.year, now.month, now.day, 0, 0).timestamp())
         end   = int(datetime.datetime(now.year, now.month, now.day, 23, 59).timestamp())
-        r = requests.get(f"{LARK_BASE}/calendar/v4/calendars/primary/events",
-                         headers=lark_headers(),
-                         params={"start_time": str(start), "end_time": str(end)})
+        r = requests.get(
+            f"{LARK_BASE}/calendar/v4/calendars/primary/events",
+            headers=lark_headers(),
+            params={"start_time": str(start), "end_time": str(end)},
+            timeout=10
+        )
         events = r.json().get("data", {}).get("items", [])
         if not events:
             return "📅 No calendar events today."
@@ -146,10 +137,13 @@ def get_today_calendar():
 # ── Weather ───────────────────────────────────────────────────────────────────
 def get_weather():
     if not WEATHER_API_KEY:
-        return "🌤️ Weather: (Add WEATHER_API_KEY to enable)"
+        return "🌤️ Weather: (Add WEATHER_API_KEY in Render to enable)"
     try:
-        r = requests.get("https://api.openweathermap.org/data/2.5/weather",
-                         params={"q": MY_CITY, "appid": WEATHER_API_KEY, "units": "metric"})
+        r = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"q": MY_CITY, "appid": WEATHER_API_KEY, "units": "metric"},
+            timeout=10
+        )
         d     = r.json()
         desc  = d["weather"][0]["description"].capitalize()
         temp  = d["main"]["temp"]
@@ -172,13 +166,22 @@ def get_pending_tasks():
 def add_task(title, assignee="me", assigner="me", due=""):
     task_counter[0] += 1
     tid = f"T{task_counter[0]:03d}"
-    task_board[tid] = {"id": tid, "title": title, "assignee": assignee,
-                       "assigner": assigner, "due": due, "status": "pending", "notes": ""}
+    task_board[tid] = {
+        "id": tid, "title": title, "assignee": assignee,
+        "assigner": assigner, "due": due, "status": "pending", "notes": ""
+    }
     return tid
+
+def detect_and_record_task(text, sender_id):
+    keywords = ["please", "tolong", "请", "需要", "task:", "assign", "can you", "follow up"]
+    if any(k in text.lower() for k in keywords):
+        return add_task(title=text[:80], assignee="me", assigner=sender_id)
+    return None
 
 # ── Daily briefing ────────────────────────────────────────────────────────────
 def send_daily_briefing():
     if not MY_OPEN_ID:
+        print("MY_OPEN_ID not set — skipping briefing", flush=True)
         return
     weather  = get_weather()
     calendar = get_today_calendar()
@@ -207,14 +210,6 @@ def briefing_scheduler():
 
 threading.Thread(target=briefing_scheduler, daemon=True).start()
 
-# ── Auto-detect task in message ───────────────────────────────────────────────
-def detect_and_record_task(text, sender_id):
-    keywords = ["please", "tolong", "请", "需要", "task:", "assign", "can you", "follow up"]
-    if any(k in text.lower() for k in keywords):
-        tid = add_task(title=text[:80], assignee="me", assigner=sender_id)
-        return tid
-    return None
-
 # ── Claude API ────────────────────────────────────────────────────────────────
 def call_claude(open_id, user_text, extra_context=""):
     history = conv_history.get(open_id, [])
@@ -222,14 +217,19 @@ def call_claude(open_id, user_text, extra_context=""):
     history.append({"role": "user", "content": full_msg})
     if len(history) > 20:
         history = history[-20:]
-
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": ANTHROPIC_API_KEY,
-                 "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"},
-        json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500,
-              "system": SYSTEM_PROMPT, "messages": history},
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1500,
+            "system": SYSTEM_PROMPT,
+            "messages": history
+        },
         timeout=30
     )
     reply = resp.json()["content"][0]["text"]
@@ -260,6 +260,9 @@ def handle_event(body):
     chat_id   = msg.get("chat_id", "")
     is_group  = chat_type == "group"
 
+    print(f"MSG from {sender_id} | group={is_group} | text={user_text[:50]}", flush=True)
+
+    # Group chat: only reply if @mentioned
     if is_group and "<at" not in user_text:
         detect_and_record_task(user_text, sender_id)
         return
@@ -267,34 +270,33 @@ def handle_event(body):
     # Clean @mention tags
     clean_text = re.sub(r'<at[^>]*>.*?</at>', '', user_text).strip()
 
-    # ── STEP 1: Send instant "thinking" message ──────────────────────────────
-    thinking_msg = get_thinking_msg(clean_text)
-    receive_id   = chat_id if is_group else sender_id
-    id_type      = "chat_id" if is_group else "open_id"
-    msg_id       = send_msg(receive_id, thinking_msg, id_type)
+    receive_id = chat_id if is_group else sender_id
+    id_type    = "chat_id" if is_group else "open_id"
 
-    # ── STEP 2: Build context for relevant queries ───────────────────────────
+    # ── Send thinking message immediately ────────────────────────────────────
+    thinking = get_thinking_msg(clean_text)
+    send_msg(receive_id, thinking, id_type)
+
+    # ── Build context ─────────────────────────────────────────────────────────
     extra = ""
     triggers = ["brief", "today", "schedule", "calendar", "task", "meeting",
                 "weather", "plan", "morning", "什么", "今天", "任务", "会议"]
     if any(t in clean_text.lower() for t in triggers):
-        # Show progress update
-        update_msg(msg_id, "⏳ Gathering your calendar, tasks & weather...")
+        send_msg(receive_id, "⏳ Gathering your data...", id_type)
         extra = f"{get_weather()}\n{get_today_calendar()}\n{get_pending_tasks()}"
 
-    # ── STEP 3: Auto-record task ─────────────────────────────────────────────
+    # ── Auto-record task ──────────────────────────────────────────────────────
     tid = detect_and_record_task(clean_text, sender_id)
     if tid:
-        extra += f"\n\n[SYSTEM: Task {tid} auto-recorded]"
+        extra += f"\n\n[SYSTEM: Task {tid} auto-recorded to task board]"
 
-    # ── STEP 4: Call Claude ───────────────────────────────────────────────────
-    update_msg(msg_id, "💬 Generating response...")
+    # ── Call Claude and send reply ────────────────────────────────────────────
     try:
         reply = call_claude(sender_id, clean_text, extra)
-        # ── STEP 5: Replace thinking message with final reply ─────────────────
-        update_msg(msg_id, reply)
+        send_msg(receive_id, reply, id_type)
     except Exception as e:
-        update_msg(msg_id, f"⚠️ Error: {str(e)}\nPlease try again.")
+        print(f"Claude error: {e}", flush=True)
+        send_msg(receive_id, f"⚠️ Sorry, something went wrong. Please try again.\nError: {str(e)}", id_type)
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
@@ -318,7 +320,7 @@ def view_tasks():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "✅ Bryen Assistant v2.1 is running!", 200
+    return "✅ Bryen Assistant v2.2 is running!", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
